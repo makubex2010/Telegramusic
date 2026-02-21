@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import hashlib
 import math
 import os
@@ -7,45 +8,43 @@ import ssl
 import traceback
 from pathlib import Path
 from urllib.parse import quote
-from zipfile import ZipFile, ZIP_DEFLATED
-import functools
+from zipfile import ZIP_DEFLATED, ZipFile
+
 import aiohttp
 import aioshutil
 import certifi  # SSL certificates
 import requests
-from aiogram import F, types
-from aiogram import Router
+from aiogram import F, Router, types
 from aiogram.types import (
-    FSInputFile,
     BufferedInputFile,
-    InputMediaAudio,
+    FSInputFile,
     InlineQuery,
-    InputTextMessageContent,
     InlineQueryResultArticle,
+    InputMediaAudio,
+    InputTextMessageContent,
 )
 from unidecode import unidecode
 
 from bot import bot
-
-from utils import (
-    __,
-    is_downloading,
-    add_downloading,
-    remove_downloading,
-    TMP_DIR,
+from dl_utils.deezer_download import (
+    TYPE_ALBUM,
+    TYPE_TRACK,
+    Deezer403Exception,
+    DeezerApiException,
+    deezer_search,
+    download_song,
+    get_file_format,
+    get_song_infos_from_deezer_website,
+    init_deezer_session,
 )
 from dl_utils.deezer_utils import clean_filename, get_audio_duration
-from dl_utils.deezer_download import (
-    init_deezer_session,
-    get_song_infos_from_deezer_website,
-    download_song,
-    deezer_search,
-    TYPE_TRACK,
-    TYPE_ALBUM,
-    DeezerApiException,
-    get_file_format,
+from utils import (
+    TMP_DIR,
+    __,
+    add_downloading,
+    is_downloading,
+    remove_downloading,
 )
-
 
 deezer_router = Router()
 
@@ -55,8 +54,23 @@ class TelegramNetworkError(Exception):
 
 
 DEFAULT_QUALITY = "flac" if os.environ.get("ENABLE_FLAC") == "1" else "mp3"
+DEEZER_PROXY = os.environ.get("DEEZER_PROXY", "").strip()
 print("Default quality: " + DEFAULT_QUALITY)
-init_deezer_session("", DEFAULT_QUALITY)
+if DEEZER_PROXY:
+    print(f"Using Deezer proxy: {DEEZER_PROXY}")
+init_deezer_session(DEEZER_PROXY, DEFAULT_QUALITY)
+
+try:
+    DEEZER_SESSION_REINIT_THRESHOLD = int(
+        os.environ.get("DEEZER_SESSION_REINIT_THRESHOLD", "3")
+    )
+except ValueError:
+    DEEZER_SESSION_REINIT_THRESHOLD = 3
+if DEEZER_SESSION_REINIT_THRESHOLD < 0:
+    DEEZER_SESSION_REINIT_THRESHOLD = 0
+print(
+    f"Session auto-refresh threshold: {DEEZER_SESSION_REINIT_THRESHOLD or 'disabled'}"
+)
 
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 5))
 print("Max retries: " + str(MAX_RETRIES))
@@ -76,6 +90,47 @@ PLAYLIST_REGEX = r"https?://(?:www\.)?deezer\.com/([a-z]*/)?playlist/(\d+)/?$"  
 
 COPY_FILES_PATH = os.environ.get("COPY_FILES_PATH")
 FILE_LINK_TEMPLATE = os.environ.get("FILE_LINK_TEMPLATE")
+
+_session_refresh_lock = None  # Lazily initialized asyncio.Lock
+
+
+def _get_session_refresh_lock():
+    global _session_refresh_lock
+    if _session_refresh_lock is None:
+        _session_refresh_lock = asyncio.Lock()
+    return _session_refresh_lock
+
+
+async def refresh_deezer_session(reason: str):
+    """Reinitialize Deezer session in a thread-safe way."""
+    lock = _get_session_refresh_lock()
+    if lock.locked():
+        print(f"Waiting for ongoing Deezer session refresh ({reason})")
+    async with lock:
+        print(f"Reinitializing Deezer session ({reason})...")
+        await asyncio.to_thread(init_deezer_session, DEEZER_PROXY, DEFAULT_QUALITY)
+        print("Deezer session refreshed.")
+
+
+async def maybe_refresh_deezer_session(
+    attempt_count: int, retries: int, context: str, error: Exception
+):
+    """
+    Refresh the Deezer session automatically if a session-related error keeps happening.
+
+    attempt_count is 1-based and represents how many consecutive attempts have failed.
+    """
+    if (
+        DEEZER_SESSION_REINIT_THRESHOLD <= 0
+        or attempt_count >= retries
+        or attempt_count % DEEZER_SESSION_REINIT_THRESHOLD != 0
+        or not isinstance(error, (DeezerApiException, Deezer403Exception))
+    ):
+        return
+
+    await refresh_deezer_session(
+        f"{context}: failure #{attempt_count} ({type(error).__name__})"
+    )
 
 
 async def download_track(track_id, retries=MAX_RETRIES):
@@ -167,6 +222,9 @@ async def download_track(track_id, retries=MAX_RETRIES):
             # The failed/empty file is handled above before raising IOError.
 
             if attempt < retries - 1:
+                await maybe_refresh_deezer_session(
+                    attempt + 1, retries, f"track {track_id}", e
+                )
                 sleep_time = 1 * (attempt + 1)
                 print(f"Retrying in {sleep_time} seconds...")
                 await asyncio.sleep(sleep_time)
@@ -213,6 +271,9 @@ async def download_album(album_id, retries=MAX_RETRIES):
                 f"Attempt {album_info_attempt}/{retries}: Error fetching album info for {album_id}: {e}"
             )
             if album_info_attempt < retries:
+                await maybe_refresh_deezer_session(
+                    album_info_attempt, retries, f"album metadata {album_id}", e
+                )
                 sleep_time = 1 * album_info_attempt
                 print(f"Retrying album info fetch in {sleep_time} seconds...")
                 await asyncio.sleep(sleep_time)
@@ -286,6 +347,12 @@ async def download_album(album_id, retries=MAX_RETRIES):
                             pass
 
                     if attempt < track_retries - 1:
+                        await maybe_refresh_deezer_session(
+                            attempt + 1,
+                            track_retries,
+                            f"album track {track_id}",
+                            track_e,
+                        )
                         sleep_time = 1 * (
                             attempt + 1
                         )  # Exponential backoff might be better

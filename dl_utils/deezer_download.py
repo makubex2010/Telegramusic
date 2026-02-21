@@ -3,19 +3,18 @@
 
 from __future__ import annotations
 
+import html.parser
+import json
 import os
 import re
-import json
-from typing import Any
-
-from Crypto.Hash import MD5
-from Crypto.Cipher import Blowfish
 import struct
 import urllib.parse
-import html.parser
-import requests
 from binascii import a2b_hex, b2a_hex
+from typing import Any
 
+import requests
+from Crypto.Cipher import Blowfish
+from Crypto.Hash import MD5
 
 # BEGIN TYPES
 TYPE_TRACK = "track"
@@ -461,12 +460,21 @@ def get_song_url(track_token: str, format: str) -> str:
         )
         response.raise_for_status()
         data = response.json()
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 401:
+            raise DeezerApiException(f"Could not retrieve song URL: {e}")
+        raise RuntimeError(f"Could not retrieve song URL: {e}")
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Could not retrieve song URL: {e}")
 
     if not data.get("data") or "errors" in data["data"][0]:
         raise RuntimeError(
             f"Could not get download url from API: {data['data'][0]['errors'][0]['message']}"
+        )
+
+    if not data["data"][0].get("media"):
+        raise RuntimeError(
+            "Could not get download url: API returned no media sources (track may not be available in your region)"
         )
 
     url = data["data"][0]["media"][0]["sources"][0]["url"]
@@ -486,6 +494,8 @@ def download_song(song: dict, deezer_format: str, output_file: str) -> None:
     url = None
     try:
         url = get_song_url(song["TRACK_TOKEN"], deezer_format)
+    except DeezerApiException:
+        raise  # Session-level error (e.g. expired token), don't try fallback
     except Exception as e:
         print(
             f"Could not download song (https://www.deezer.com/us/track/{song['SNG_ID']}). Maybe it's not available anymore or at least not in your country. {e}"
@@ -592,7 +602,28 @@ def get_song_infos_from_deezer_website(search_type, id):
                     songs.append(song)
             elif DZR_APP_STATE["DATA"]["__TYPE__"] == "song":
                 # just one song on that page
-                songs.append(DZR_APP_STATE["DATA"])
+                song = DZR_APP_STATE["DATA"]
+                # Fetch album artist separately — may differ from track artist on compilations
+                alb_id = DZR_APP_STATE["DATA"].get("ALB_ID")
+                if alb_id:
+                    try:
+                        alb_resp = session.get(
+                            "https://www.deezer.com/us/{}/{}".format(TYPE_ALBUM, alb_id)
+                        )
+                        alb_parser = ScriptExtractor()
+                        alb_parser.feed(alb_resp.text)
+                        alb_parser.close()
+                        for alb_script in alb_parser.scripts:
+                            alb_regex = re.search(r'{"DATA":.*', alb_script)
+                            if alb_regex:
+                                alb_data = json.loads(alb_regex.group()).get("DATA", {})
+                                song["ALB_ART_NAME"] = alb_data.get(
+                                    "ART_NAME", song.get("ART_NAME", "")
+                                )
+                                break
+                    except Exception:
+                        pass  # Non-critical, fall back to track artist
+                songs.append(song)
     return songs[0] if search_type == TYPE_TRACK else songs
 
 
